@@ -83,10 +83,11 @@ async function connectWhatsApp() {
             name,
             text,
             time: new Date().toISOString(),
-            replied: false
+            replied: false,
+            sent: false
           })
 
-          if (messages.length > 100) messages = messages.slice(0, 100)
+          if (messages.length > 200) messages = messages.slice(0, 200)
         }
       }
     })
@@ -108,7 +109,24 @@ app.post('/reply', async (req, res) => {
   }
   try {
     await sock.sendMessage(to, { text })
+
+    // Sent message ও list এ রাখো
+    messages.unshift({
+      id: Date.now().toString(),
+      from: 'me',
+      to: to,
+      name: 'You',
+      text: text,
+      time: new Date().toISOString(),
+      replied: true,
+      sent: true
+    })
+
+    // কাস্টমারের সব মেসেজ replied মার্ক করো
     messages = messages.map(m => m.from === to ? { ...m, replied: true } : m)
+
+    if (messages.length > 200) messages = messages.slice(0, 200)
+
     res.json({ success: true })
   } catch (err) {
     res.status(500).json({ error: err.message })
