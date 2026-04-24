@@ -1,9 +1,9 @@
-const { default: makeWASocket, DisconnectReason, useMultiFileAuthState } = require('@whiskeysockets/baileys')
+const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys')
 const express = require('express')
 const cors = require('cors')
 const QRCode = require('qrcode')
 const pino = require('pino')
-const fs = require('fs')
+const NodeCache = require('node-cache')
 
 const app = express()
 app.use(cors())
@@ -13,50 +13,57 @@ let sock = null
 let qrCodeData = null
 let connectionStatus = 'disconnected'
 let messages = []
-
-// In-memory auth store (Railway ফাইল সেভ করতে পারে না তাই)
-const authState = {
-  creds: null,
-  keys: {}
-}
+const msgRetryCounterCache = new NodeCache()
 
 async function connectWhatsApp() {
   try {
     const { state, saveCreds } = await useMultiFileAuthState('/tmp/auth_info')
 
     sock = makeWASocket({
-      auth: state,
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' }))
+      },
       logger: pino({ level: 'silent' }),
       printQRInTerminal: false,
-      browser: ['WhatsApp Support', 'Chrome', '1.0.0']
+      msgRetryCounterCache,
+      defaultQueryTimeoutMs: undefined,
+      browser: ['Ubuntu', 'Chrome', '20.0.04'],
+      connectTimeoutMs: 60000,
+      keepAliveIntervalMs: 10000,
+      retryRequestDelayMs: 2000
     })
 
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update
-      console.log('Connection update:', connection, qr ? 'QR received' : '')
+      console.log('Update:', JSON.stringify({ connection, qr: !!qr }))
 
       if (qr) {
         qrCodeData = await QRCode.toDataURL(qr)
         connectionStatus = 'qr_ready'
-        console.log('QR Code generated!')
+        console.log('QR ready!')
       }
 
       if (connection === 'close') {
         const code = lastDisconnect?.error?.output?.statusCode
-        const shouldReconnect = code !== DisconnectReason.loggedOut
+        console.log('Closed, code:', code)
         connectionStatus = 'disconnected'
         qrCodeData = null
-        console.log('Connection closed, code:', code)
-        if (shouldReconnect) {
-          console.log('Reconnecting...')
-          setTimeout(connectWhatsApp, 3000)
+
+        if (code === DisconnectReason.loggedOut) {
+          console.log('Logged out, clearing session...')
+          const fs = require('fs')
+          try { fs.rmSync('/tmp/auth_info', { recursive: true }) } catch(e) {}
+          setTimeout(connectWhatsApp, 2000)
+        } else {
+          setTimeout(connectWhatsApp, 5000)
         }
       }
 
       if (connection === 'open') {
         connectionStatus = 'connected'
         qrCodeData = null
-        console.log('WhatsApp connected successfully!')
+        console.log('Connected!')
       }
     })
 
@@ -80,33 +87,24 @@ async function connectWhatsApp() {
           })
 
           if (messages.length > 100) messages = messages.slice(0, 100)
-          console.log(`Message from ${name}: ${text}`)
         }
       }
     })
 
   } catch (err) {
-    console.log('Error connecting:', err.message)
+    console.log('Error:', err.message)
     setTimeout(connectWhatsApp, 5000)
   }
 }
 
-app.get('/', (req, res) => {
-  res.json({ status: 'running', whatsapp: connectionStatus })
-})
-
-app.get('/qr', (req, res) => {
-  res.json({ status: connectionStatus, qr: qrCodeData })
-})
-
-app.get('/messages', (req, res) => {
-  res.json(messages)
-})
+app.get('/', (req, res) => res.json({ status: 'ok', whatsapp: connectionStatus }))
+app.get('/qr', (req, res) => res.json({ status: connectionStatus, qr: qrCodeData }))
+app.get('/messages', (req, res) => res.json(messages))
 
 app.post('/reply', async (req, res) => {
   const { to, text } = req.body
   if (!sock || connectionStatus !== 'connected') {
-    return res.status(400).json({ error: 'WhatsApp not connected' })
+    return res.status(400).json({ error: 'Not connected' })
   }
   try {
     await sock.sendMessage(to, { text })
@@ -119,6 +117,6 @@ app.post('/reply', async (req, res) => {
 
 const PORT = process.env.PORT || 3000
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`)
+  console.log('Server on port', PORT)
   connectWhatsApp()
 })
