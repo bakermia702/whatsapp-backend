@@ -3,6 +3,7 @@ const express = require('express')
 const cors = require('cors')
 const QRCode = require('qrcode')
 const pino = require('pino')
+const fs = require('fs')
 
 const app = express()
 app.use(cors())
@@ -13,66 +14,86 @@ let qrCodeData = null
 let connectionStatus = 'disconnected'
 let messages = []
 
-async function connectWhatsApp() {
-  const { state, saveCreds } = await useMultiFileAuthState('auth_info')
-
-  sock = makeWASocket({
-    auth: state,
-    logger: pino({ level: 'silent' }),
-    printQRInTerminal: false
-  })
-
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update
-
-    if (qr) {
-      qrCodeData = await QRCode.toDataURL(qr)
-      connectionStatus = 'qr_ready'
-      console.log('QR Code ready')
-    }
-
-    if (connection === 'close') {
-      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut
-      connectionStatus = 'disconnected'
-      if (shouldReconnect) {
-        setTimeout(connectWhatsApp, 3000)
-      }
-    }
-
-    if (connection === 'open') {
-      connectionStatus = 'connected'
-      qrCodeData = null
-      console.log('WhatsApp connected!')
-    }
-  })
-
-  sock.ev.on('creds.update', saveCreds)
-
-  sock.ev.on('messages.upsert', async ({ messages: newMessages }) => {
-    for (const msg of newMessages) {
-      if (!msg.key.fromMe && msg.message) {
-        const text = msg.message?.conversation ||
-                     msg.message?.extendedTextMessage?.text || ''
-        const from = msg.key.remoteJid
-        const name = msg.pushName || 'Unknown'
-        const id = msg.key.id
-
-        messages.unshift({
-          id,
-          from,
-          name,
-          text,
-          time: new Date().toISOString(),
-          replied: false,
-          aiSuggestion: null
-        })
-
-        if (messages.length > 100) messages = messages.slice(0, 100)
-        console.log(`New message from ${name}: ${text}`)
-      }
-    }
-  })
+// In-memory auth store (Railway ফাইল সেভ করতে পারে না তাই)
+const authState = {
+  creds: null,
+  keys: {}
 }
+
+async function connectWhatsApp() {
+  try {
+    const { state, saveCreds } = await useMultiFileAuthState('/tmp/auth_info')
+
+    sock = makeWASocket({
+      auth: state,
+      logger: pino({ level: 'silent' }),
+      printQRInTerminal: false,
+      browser: ['WhatsApp Support', 'Chrome', '1.0.0']
+    })
+
+    sock.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect, qr } = update
+      console.log('Connection update:', connection, qr ? 'QR received' : '')
+
+      if (qr) {
+        qrCodeData = await QRCode.toDataURL(qr)
+        connectionStatus = 'qr_ready'
+        console.log('QR Code generated!')
+      }
+
+      if (connection === 'close') {
+        const code = lastDisconnect?.error?.output?.statusCode
+        const shouldReconnect = code !== DisconnectReason.loggedOut
+        connectionStatus = 'disconnected'
+        qrCodeData = null
+        console.log('Connection closed, code:', code)
+        if (shouldReconnect) {
+          console.log('Reconnecting...')
+          setTimeout(connectWhatsApp, 3000)
+        }
+      }
+
+      if (connection === 'open') {
+        connectionStatus = 'connected'
+        qrCodeData = null
+        console.log('WhatsApp connected successfully!')
+      }
+    })
+
+    sock.ev.on('creds.update', saveCreds)
+
+    sock.ev.on('messages.upsert', async ({ messages: newMessages }) => {
+      for (const msg of newMessages) {
+        if (!msg.key.fromMe && msg.message) {
+          const text = msg.message?.conversation ||
+                       msg.message?.extendedTextMessage?.text || ''
+          const from = msg.key.remoteJid
+          const name = msg.pushName || 'Unknown'
+
+          messages.unshift({
+            id: msg.key.id,
+            from,
+            name,
+            text,
+            time: new Date().toISOString(),
+            replied: false
+          })
+
+          if (messages.length > 100) messages = messages.slice(0, 100)
+          console.log(`Message from ${name}: ${text}`)
+        }
+      }
+    })
+
+  } catch (err) {
+    console.log('Error connecting:', err.message)
+    setTimeout(connectWhatsApp, 5000)
+  }
+}
+
+app.get('/', (req, res) => {
+  res.json({ status: 'running', whatsapp: connectionStatus })
+})
 
 app.get('/qr', (req, res) => {
   res.json({ status: connectionStatus, qr: qrCodeData })
@@ -96,35 +117,8 @@ app.post('/reply', async (req, res) => {
   }
 })
 
-app.post('/ai-suggest', async (req, res) => {
-  const { customerMessage, businessContext } = req.body
-  try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 300,
-        messages: [{
-          role: 'user',
-          content: `তুমি একজন কাস্টমার সার্ভিস এক্সপার্ট। ব্যবসার বিষয়: ${businessContext || 'সাধারণ ব্যবসা'}। 
-কাস্টমারের মেসেজ: "${customerMessage}"
-একটি সংক্ষিপ্ত, বাংলায় প্রফেশনাল রিপ্লাই লেখো।`
-        }]
-      })
-    })
-    const data = await response.json()
-    res.json({ suggestion: data.content[0].text })
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
-})
-
-app.listen(3000, () => {
-  console.log('Server running on port 3000')
+const PORT = process.env.PORT || 3000
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`)
   connectWhatsApp()
 })
